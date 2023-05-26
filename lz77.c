@@ -1,283 +1,327 @@
-/***************************************************************************
- *          Lempel, Ziv Encoding and Decoding
- *
- *   File    : lz77.c
- *   Authors : David Costa and Pietro De Rosa
- *
- ***************************************************************************/
-
-/***************************************************************************
- *                             INCLUDED FILES
- ***************************************************************************/
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <string.h>
-#include "bitio.h"
-#include "tree.h"
 
-/***************************************************************************
- *                                CONSTANTS
- ***************************************************************************/
-#define DEFAULT_LA_SIZE 15      /* lookahead size */
-#define DEFAULT_SB_SIZE 4095    /* search buffer size */
-#define N 3
-#define MAX_BIT_BUFFER 16
+// windowSize = Size of dictionary
+// bufferSize = Size of lookahead buffer
+// Important: windowSize < 255 & windowSize > bufferSize!
+#define windowSize 60
+#define bufferSize 40
+#define arraySize bufferSize + windowSize
 
-/***************************************************************************
- *                            TYPE DEFINITIONS
- * Each token is composed by a backward offset, the match's length and the
- * next character in the lookahead.
- * Offset : [0, SB_SIZE]            Length : [0, LA_SIZE]
- ***************************************************************************/
-struct token{
-    int off, len;
-    char next;
-};
+typedef enum { false, true } bool;
 
-/***************************************************************************
- *                         FUNCTIONS DECLARATION
- ***************************************************************************/
-void writecode(struct token t, struct bitFILE *out, int la_size, int sb_size);
-struct token readcode(struct bitFILE *file, int la_size, int sb_size);
+// ============================================================================
 
-struct token match(struct node *tree, int root, unsigned char *window, int la, int la_size);
+// This method searches for a match from str[] in window[] of strLen length.
+// Returns the position of the match starting from the beginning of window[],
+// or -1 if no match is found.
+// Is invoked during every iteration of the compression algorithm.
+int findMatch(unsigned char window[], unsigned char str[], int strLen) {
+    int j, k, pos = -1;
 
-/***************************************************************************
- *                            ENCODE FUNCTION
- * Name         : encode - compress file
- * Parameters   : file - file to encode
- *                out - compressed file
- ***************************************************************************/
-void encode(FILE *file, struct bitFILE *out, int la, int sb)
-{
-    /* variables */
-    int i, root = -1;
-    int eof;
-    struct node *tree;
-    struct token t;
-    unsigned char *window;
-    int la_size, sb_size = 0;    /* actual lookahead and search buffer size */
-    int buff_size;
-    int sb_index = 0, la_index = 0;
-    int LA_SIZE, SB_SIZE, WINDOW_SIZE;
-    
-    /* set window parameters */
-    LA_SIZE = (la == -1) ? DEFAULT_LA_SIZE : la;
-    SB_SIZE = (sb == -1) ? DEFAULT_SB_SIZE : sb;
-    WINDOW_SIZE = (SB_SIZE * N) + LA_SIZE;
-    
-    window = calloc(WINDOW_SIZE, sizeof(unsigned char));
-    
-    tree = createTree(SB_SIZE);
-    
-    /* write header */
-    bitIO_write(out, &SB_SIZE, MAX_BIT_BUFFER);
-    bitIO_write(out, &LA_SIZE, MAX_BIT_BUFFER);
-    
-    /* fill the lookahead with the first LA_SIZE bytes or until EOF is reached */
-    buff_size = fread(window, 1, WINDOW_SIZE, file);
-    if(ferror(file)) {
-        printf("Error loading the data in the window.\n");
-        return;
-   	}
-    
-    eof = feof(file);
-    
-    /* set lookahead's size */
-    la_size = (buff_size > LA_SIZE) ? LA_SIZE : buff_size;
-    
-	while(buff_size > 0){
-		
-        /* find the longest match of the lookahead in the tree*/
-        t = match(tree, root, window, la_index, la_size);
-        
-        /* write the token in the output file */
-        writecode(t, out, LA_SIZE, SB_SIZE);
-        
-        /* read as many bytes as matched in the previuos iteration */
-        for(i = 0; i < t.len + 1; i++){
-            
-            /* if search buffer's length is max, the oldest node is removed from the tree */
-            if(sb_size == SB_SIZE){
-                delete(tree, &root, window, sb_index, SB_SIZE);
-                sb_index++;
-            }else
-                sb_size++;
-            
-            /* insert a new node in the tree */
-            insert(tree, &root, window, la_index, la_size, SB_SIZE);
-            la_index++;
-            
-            if (eof == 0){
-                /* scroll backward the buffer when it is almost full */
-                if (sb_index == SB_SIZE * (N - 1)){
-                    memmove(window, &(window[sb_index]), sb_size+la_size);
-                    
-                    /* update the node's offset when the buffer is scrolled */
-                    updateOffset(tree, sb_index, SB_SIZE);
-                    
-                    sb_index = 0;
-                    la_index = sb_size;
-                    
-                    /* read from file */
-                    buff_size += fread(&(window[sb_size+la_size]), 1, WINDOW_SIZE-(sb_size+la_size), file);
-                    if(ferror(file)) {
-                        printf("Error loading the data in the window.\n");
-                        return;
-                    }
-                    eof = feof(file);
-                }
-            }
-            
-            buff_size--;
-            /* case where we hit EOF before filling lookahead */
-            la_size = (buff_size > LA_SIZE) ? LA_SIZE : buff_size;
+    for (int i = 0; i <= windowSize - strLen; i++) {
+        pos = k = i;
+
+        for (j = 0; j < strLen; j++) {
+            if (str[j] == window[k])
+                k++;
+            else
+                break;
         }
-	}
-    
-    destroyTree(tree);
-    free(window);
-}
-
-/***************************************************************************
- *                            DECODE FUNCTION
- * Name         : decode - decompress file
- * Parameters   : file - compressed file
- *                out - output file
- ***************************************************************************/
-void decode(struct bitFILE *file, FILE *out)
-{
-    /* variables */
-    struct token t;
-    int back = 0, off;
-    unsigned char *buffer;
-    int SB_SIZE, LA_SIZE, WINDOW_SIZE;
-    
-    /* read header */
-    bitIO_read(file, &SB_SIZE, sizeof(SB_SIZE), MAX_BIT_BUFFER);
-    bitIO_read(file, &LA_SIZE, sizeof(LA_SIZE), MAX_BIT_BUFFER);
-    
-    WINDOW_SIZE = (SB_SIZE * N) + LA_SIZE;
-    
-    buffer = (unsigned char*)calloc(WINDOW_SIZE, sizeof(unsigned char));
-    
-    while(1)
-    {
-        /* read the code from the input file */
-        t = readcode(file, LA_SIZE, SB_SIZE);
-
-        if(t.off == -1)
-            break;
-        
-        if(back + t.len > WINDOW_SIZE - 1){
-            memcpy(buffer, &(buffer[back - SB_SIZE]), SB_SIZE);
-            back = SB_SIZE;
-        }
-        
-        /* reconstruct the original byte*/
-        while(t.len > 0)
-        {
-            off = back - t.off;
-            buffer[back] = buffer[off];
-            
-            /* write the byte in the output file*/
-            putc(buffer[back], out);
-            
-            back++;
-            t.len--;
-        }
-        buffer[back] = t.next;
-        
-        /* write the byte in the output file*/
-        putc(buffer[back], out);
-        
-        back++;
+        if (j == strLen)
+            return pos;
     }
-    
+
+    return -1;
 }
 
-/***************************************************************************
- *                            MATCH FUNCTION
- * Name         : match - find the longest match and create the token
- * Parameters   : tree - binary search tree
- *                root - index of the root
- *                window - pointer to the buffer
- *                la - starting index of the lookahead
- *                la_size - actual lookahead size
- * Returned     : token of the best match
- ***************************************************************************/
-struct token match(struct node *tree, int root, unsigned char *window, int la, int la_size)
-{
-    /* variables */
-    struct token t;
-    struct ret r;
-    
-    /* find the longest match */
-    r = find(tree, root, window, la, la_size);
-    
-    /* create the token */
-    t.off = r.off;
-    t.len = r.len;
-    t.next = window[la+r.len];
-    
-    return t;
+// ============================================================================
+
+// This method contains the logic of the compression algorithm.
+// Is invoked when "-c" option is specified in launch command, followed by file name.
+int compress(char* inputPath) {
+    FILE *fileInput;
+    FILE *fileOutput;
+    bool last = false;
+    int inputLength = 0;
+    int outputLength = 0;
+    int endOffset = 0;
+    int pos = -1;
+    int i, size, shift, c_in;
+    size_t bytesRead = (size_t) -1;
+    unsigned char c;
+    unsigned char array[arraySize];
+    unsigned char window[windowSize];
+    unsigned char buffer[bufferSize];
+    unsigned char loadBuffer[bufferSize];
+    unsigned char str[bufferSize];
+
+    // Open I/O files
+    char path[30] = "input/";
+    strcat(path, inputPath);
+    fileInput = fopen(path, "rb");
+    fileOutput = fopen("output/output.lz77", "wb");
+
+    // If unable to open file, return alert
+    if (!fileInput) {
+        fprintf(stderr, "Unable to open fileInput %s", inputPath);
+        return 0;
+    }
+
+    // Get fileInput length
+    fseek(fileInput, 0, SEEK_END);
+    inputLength = ftell(fileInput);
+    fseek(fileInput, 0, SEEK_SET);
+
+    fprintf(stdout, "Input file size: %d bytes", inputLength);
+
+    // If file is empty, return alert
+    if (inputLength == 0)
+        return 3;
+
+    // If file length is smaller than arraySize, not worth processing
+    if (inputLength < arraySize)
+        return 2;
+
+    // Load array with initial bytes
+    fread(array, 1, arraySize, fileInput);
+
+    // Write the first bytes to output file
+    fwrite(array, 1, windowSize, fileOutput);
+
+    // LZ77 logic beginning
+    while (true) {
+        if ((c_in = fgetc(fileInput)) == EOF)
+            last = true;
+        else
+            c = (unsigned char) c_in;
+
+        // Load window (dictionary)
+        for (int k = 0; k < windowSize; k++)
+            window[k] = array[k];
+
+        // Load buffer (lookahead)
+        for (int k = windowSize, j = 0; k < arraySize; k++, j++) {
+            buffer[j] = array[k];
+            str[j] = array[k];
+        }
+
+        // Search for longest match in window
+        if (endOffset != 0) {
+            size = bufferSize - endOffset;
+            if (endOffset == bufferSize)
+                break;
+        }
+        else {
+            size = bufferSize;
+        }
+
+        pos = -1;
+        for (i = size; i > 0; i--) {
+            pos = findMatch(window, str, i);
+            if (pos != -1)
+                break;
+        }
+
+        // No match found
+        // Write only one byte instead of two
+        // 255 -> offset = 0, match = 0
+        if (pos == -1) {
+            fputc(255, fileOutput);
+            fputc(buffer[0], fileOutput);
+            shift = 1;
+        }
+            // Found match
+            // offset = windowSize - position of match
+            // i = number of match bytes
+            // endOffset = number of bytes in lookahead buffer not to be considered (EOF)
+        else {
+            fputc(windowSize - pos, fileOutput);
+            fputc(i, fileOutput);
+            if (i == bufferSize) {
+                shift = bufferSize + 1;
+                if (!last)
+                    fputc(c, fileOutput);
+                else
+                    endOffset = 1;
+            }
+            else {
+                if (i + endOffset != bufferSize)
+                    fputc(buffer[i], fileOutput);
+                else
+                    break;
+                shift = i + 1;
+            }
+        }
+
+        // Shift buffers
+        for (int j = 0; j < arraySize - shift; j++)
+            array[j] = array[j + shift];
+        if (!last)
+            array[arraySize - shift] = c;
+
+        if (shift == 1 && last)
+            endOffset++;
+
+        // If (shift != 1) -> read more bytes from file
+        if (shift != 1) {
+            // Load loadBuffer with new bytes
+            bytesRead = fread(loadBuffer, 1, (size_t) shift - 1, fileInput);
+
+            // Load array with new bytes
+            // Shift bytes in array, then splitted into window[] and buffer[] during next iteration
+            for (int k = 0, l = arraySize - shift + 1; k < shift - 1; k++, l++)
+                array[l] = loadBuffer[k];
+
+            if (last) {
+                endOffset += shift;
+                continue;
+            }
+
+            if (bytesRead < shift - 1)
+                endOffset = shift - 1 - bytesRead;
+        }
+    }
+
+    // Get fileOutput length
+    fseek(fileOutput, 0, SEEK_END);
+    outputLength = ftell(fileOutput);
+    fseek(fileOutput, 0, SEEK_SET);
+
+    fprintf(stdout, "\nOutput file size: %d bytes\n", outputLength);
+
+    // Close I/O files
+    fclose(fileInput);
+    fclose(fileOutput);
+
+    return 1;
 }
 
-/***************************************************************************
- *                           WRITECODE FUNCTION
- * Name         : writecode - write the token in the output file
- * Parameters   : t - token to be written
- *                out - output file
- * SB_SIZE = n  =>  ceil(log(n)/log(2)) bits for Offset representation
- * LA_SIZE = m  =>  ceil(log(m)/log(2)) bits for Length representation
- * Alway 8 bits for Next char representation
- *
- * DEFAULT (LA_SIZE = 15, SB_SIZE = 4095):
- * Offset : 12 bits representation => [0, 4095]
- * Length : 4 bits representation => [0, 15]
- * Next char requires 8 bits
- * Total token's size: 12 + 4 + 8 = 24 bits = 3 bytes
- *
- *     0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
- *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *    |         offset        |lenght |   next char   |
- *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- ***************************************************************************/
-void writecode(struct token t, struct bitFILE *out, int la_size, int sb_size)
-{
+// ============================================================================
 
-    bitIO_write(out, &t.off, bitof(sb_size));
-    bitIO_write(out, &t.len, bitof(la_size));
-    bitIO_write(out, &t.next, 8);
+// This method contains the logic of the inverse algorithm, used to decompress.
+// Is invoked when "-d" option is specified in launch command.
+int decompress() {
+    FILE *fileInput;
+    FILE *fileOutput;
+    int shift, offset, match, c_in;
+    bool done = false;
+    unsigned char c;
+    unsigned char window[windowSize];
+    unsigned char writeBuffer[windowSize];
+    unsigned char readBuffer[2];
+
+    // Open I/O files
+    fileInput = fopen("output/output.lz77", "rb");
+    fileOutput = fopen("output/file", "wb");
+
+    if (!fileInput) {
+        fprintf(stderr, "Unable to open fileInput %s", "output.lz77");
+        return 0;
+    }
+
+    // Load array with initial bytes and write to file
+    fread(window, 1, windowSize, fileInput);
+    fwrite(window, 1, windowSize, fileOutput);
+
+    // Inverse algorithm beginning
+    while (true) {
+        // Read file by couples/triads to reconstruct original file
+        size_t bytesRead = fread(readBuffer, 1, 2, fileInput);
+
+        if (bytesRead >= 2) {
+            offset = (int) readBuffer[0];
+            match = (int) readBuffer[1];
+
+            // If first byte of readBuffer is 255 -> offset = 0, match = 0
+            if (offset == 255) {
+                offset = 0;
+                c = (unsigned char) match;
+                match = 0;
+                shift = match + 1;
+            }
+            else {
+                shift = match + 1;
+                c_in = fgetc(fileInput);
+                if (c_in == EOF)
+                    done = true;
+                else
+                    c = (unsigned char) c_in;
+            }
+
+            // Load and write occurrence to file
+            for (int i = 0, j = windowSize - offset; i < match; i++, j++)
+                writeBuffer[i] = window[j];
+            fwrite(writeBuffer, 1, (size_t) match, fileOutput);
+
+            if (!done)
+                fputc(c, fileOutput);
+
+            // Shift window
+            for (int i = 0; i < windowSize - shift; i++)
+                window[i] = window[i + shift];
+
+            for (int i = 0, j = windowSize - shift; i < match; i++, j++)
+                window[j] = writeBuffer[i];
+            window[windowSize - 1] = c;
+        }
+        else {
+            break;
+        }
+    }
+
+    // Close I/O files
+    fclose(fileInput);
+    fclose(fileOutput);
+
+    return 1;
 }
 
-/***************************************************************************
- *                          READCODE FUNCTION
- * Name         : readcode - read the token from the compressed file
- * Parameters   : file - compressed file
- * Returned     : t - reconstructed token
- ***************************************************************************/
-struct token readcode(struct bitFILE *file, int la_size, int sb_size)
-{
-	/* variables */
-	struct token t;
-	int ret = 0;
+// ============================================================================
 
-	ret += bitIO_read(file, &t.off, sizeof(t.off), bitof(sb_size));
-	ret += bitIO_read(file, &t.len, sizeof(t.len), bitof(la_size));
-	ret += bitIO_read(file, &t.next, sizeof(t.next), 8);
-		
-	/* check for EOF or ERR */	
-	if(ret < (bitof(sb_size) + bitof(la_size) + 8)){
-		/* ERR */		
-		if(bitIO_ferror(file) != 0)
-		{
-			perror("Error reading bits.\n");
-			exit(EXIT_FAILURE);
-		}
-		/* EOF */
-		t.off = -1;
-	}
+// This method is the controller, reads user inputs.
+// Is invoked on program launch.
+int main(int argc, char* argv[]) {
+    clock_t begin = clock();
 
-	return t;
+    if (argc < 2) {
+        printf("Needs 2 arguments: [-c|-d] [file_path]");
+    } else {
+        // Start decompression
+        if (strcmp(argv[1], "-d") == 0) {
+            int result = decompress();
+            if (result == 0) {
+                fprintf(stderr, "\nDecompression FAIL");
+            } else if (result == 1) {
+                printf("\nDecompression OK");
+            }
+        }
+            // Start compression
+        else if (strcmp(argv[1], "-c") == 0) {
+            int result = compress(argv[2]);
+            if (result == 0) {
+                fprintf(stderr, "\nCompression FAIL\n");
+            } else if (result == 1) {
+                printf("\nCompression OK");
+            } else if (result == 2) {
+                fprintf(stderr, "\nFile too small\n");
+            } else if (result == 3) {
+                fprintf(stderr, "\nFile is EMPTY\n");
+            }
+        } else {
+            printf("Invalid arguments");
+        }
+    }
+
+    // Print execution time
+    clock_t end = clock();
+    printf("\n\nExecution time: ");
+    printf("%f", ((double) (end - begin) / CLOCKS_PER_SEC));
+    printf(" [seconds]\n");
+
+    return 0;
 }
+
+// ============================================================================
